@@ -18,6 +18,68 @@ func (a *allSessionsCommandAgent) ListAllSessions(context.Context) ([]AgentSessi
 	return a.sessions, nil
 }
 
+type switchAgentsCommandAgent struct {
+	stubAgent
+	workDir string
+	all     []AgentSessionInfo
+}
+
+func (a *switchAgentsCommandAgent) GetWorkDir() string { return a.workDir }
+func (a *switchAgentsCommandAgent) SetWorkDir(dir string) {
+	a.workDir = dir
+}
+func (a *switchAgentsCommandAgent) ListAllSessions(context.Context) ([]AgentSessionInfo, error) {
+	return a.all, nil
+}
+
+func TestSwitchByAgentsIndexChangesSessionAndWorkDir(t *testing.T) {
+	baseDir := t.TempDir()
+	targetDir := t.TempDir()
+	agent := &switchAgentsCommandAgent{
+		workDir: baseDir,
+		all: []AgentSessionInfo{
+			{ID: "codex-1", Summary: "first", WorkDir: baseDir, MessageCount: 1},
+			{ID: "codex-2", Summary: "second", WorkDir: targetDir, MessageCount: 2},
+		},
+	}
+	p := &stubPlatformEngine{n: "feishu"}
+	state := NewProjectStateStore(filepath.Join(t.TempDir(), "state.json"))
+	e := NewEngine("test", agent, []Platform{p}, "", LangChinese)
+	e.SetProjectStateStore(state)
+	defer e.cancel()
+
+	msg := &Message{SessionKey: "feishu:chat:user", UserID: "u1", ReplyCtx: "ctx"}
+	if !e.handleCommand(p, msg, "/switch 2") {
+		t.Fatal("/switch 2 should be handled")
+	}
+	if got := agent.GetWorkDir(); got != targetDir {
+		t.Fatalf("work directory = %q, want %q", got, targetDir)
+	}
+	if got := e.sessions.GetOrCreateActive(msg.SessionKey).GetAgentSessionID(); got != "codex-2" {
+		t.Fatalf("active session ID = %q, want codex-2", got)
+	}
+	if got := state.WorkDirOverride(); got != targetDir {
+		t.Fatalf("persisted work directory = %q, want %q", got, targetDir)
+	}
+}
+
+func TestHelpListsSlashSwitchAndAgentsCommands(t *testing.T) {
+	p := &stubPlatformEngine{n: "feishu"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangChinese)
+	defer e.cancel()
+	e.cmdHelp(p, &Message{SessionKey: "feishu:chat:user", ReplyCtx: "ctx"})
+
+	sent := p.getSent()
+	if len(sent) != 1 {
+		t.Fatalf("help replies = %d, want 1", len(sent))
+	}
+	for _, want := range []string{"/switch", "/agents"} {
+		if !strings.Contains(sent[0], want) {
+			t.Errorf("help text %q does not contain %q", sent[0], want)
+		}
+	}
+}
+
 func TestNormalizeBareCommand(t *testing.T) {
 	tests := []struct {
 		input string

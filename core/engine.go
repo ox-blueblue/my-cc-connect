@@ -7836,12 +7836,7 @@ func (e *Engine) cmdAgents(p Platform, msg *Message) {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
-	lister, ok := agent.(AllAgentSessionsLister)
-	if !ok {
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgListError), "agent does not support all-session listing"))
-		return
-	}
-	sessions, err := lister.ListAllSessions(e.ctx)
+	sessions, err := e.listAllAgentSessions(agent)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgListError), err))
 		return
@@ -7867,6 +7862,14 @@ func (e *Engine) cmdAgents(p Platform, msg *Message) {
 	e.reply(p, msg.ReplyCtx, sb.String())
 }
 
+func (e *Engine) listAllAgentSessions(agent Agent) ([]AgentSessionInfo, error) {
+	lister, ok := agent.(AllAgentSessionsLister)
+	if !ok {
+		return nil, fmt.Errorf("agent does not support all-session listing")
+	}
+	return lister.ListAllSessions(e.ctx)
+}
+
 func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	if len(args) == 0 {
 		e.reply(p, msg.ReplyCtx, "Usage: /switch <number | id_prefix | name>")
@@ -7880,21 +7883,53 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
 		return
 	}
-	agentSessions, err := agent.ListSessions(e.ctx)
-	if err != nil {
-		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
-		return
+	var matched *AgentSessionInfo
+	globalIndex, indexErr := strconv.Atoi(query)
+	usedGlobalList := false
+	if indexErr == nil && globalIndex > 0 {
+		if _, ok := agent.(AllAgentSessionsLister); ok {
+			usedGlobalList = true
+		}
+		if allSessions, listErr := e.listAllAgentSessions(agent); listErr == nil {
+			if globalIndex <= len(allSessions) {
+				matched = &allSessions[globalIndex-1]
+			}
+		} else if usedGlobalList {
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, listErr))
+			return
+		}
 	}
-	agentSessions = e.applySessionFilter(agentSessions, sessions, msg.SessionKey)
 
-	matched := e.matchSession(agentSessions, sessions, query)
+	if matched == nil && !usedGlobalList {
+		agentSessions, err := agent.ListSessions(e.ctx)
+		if err != nil {
+			e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+			return
+		}
+		agentSessions = e.applySessionFilter(agentSessions, sessions, msg.SessionKey)
+		matched = e.matchSession(agentSessions, sessions, query)
+	}
 	if matched == nil {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), query))
 		return
 	}
 
+	targetAgent, targetSessions, targetInteractiveKey := agent, sessions, interactiveKey
+	if matched.WorkDir != "" {
+		var err error
+		targetAgent, targetSessions, targetInteractiveKey, err = e.prepareSwitchWorkDir(
+			agent, sessions, msg, interactiveKey, matched.WorkDir)
+		if err != nil {
+			e.reply(p, msg.ReplyCtx, err.Error())
+			return
+		}
+	}
+
 	slog.Info("cmdSwitch: cleaning up old session", "session_key", msg.SessionKey)
 	e.cleanupInteractiveState(interactiveKey)
+	if targetInteractiveKey != interactiveKey {
+		e.cleanupInteractiveState(targetInteractiveKey)
+	}
 	slog.Info("cmdSwitch: cleanup done", "session_key", msg.SessionKey)
 
 	// NOTE: Do NOT call session.ClearHistory() on the returned Session.
@@ -7903,18 +7938,49 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	// original conversation; wiping it makes /history return empty after a
 	// /switch round-trip. When SwitchToAgentSession creates a fresh Session
 	// (no prior match), History is already nil, so preserving is a no-op.
-	_ = sessions.SwitchToAgentSession(msg.SessionKey, matched.ID, agent.Name(), matched.Summary)
+	_ = targetSessions.SwitchToAgentSession(msg.SessionKey, matched.ID, targetAgent.Name(), matched.Summary)
 
 	shortID := matched.ID
 	if len(shortID) > 12 {
 		shortID = shortID[:12]
 	}
-	displayName := sessions.GetSessionName(matched.ID)
+	displayName := targetSessions.GetSessionName(matched.ID)
 	if displayName == "" {
 		displayName = matched.Summary
 	}
 	e.reply(p, msg.ReplyCtx,
 		e.i18n.Tf(MsgSwitchSuccess, displayName, shortID, matched.MessageCount))
+}
+
+func (e *Engine) prepareSwitchWorkDir(agent Agent, sessions *SessionManager, msg *Message, interactiveKey, workDir string) (Agent, *SessionManager, string, error) {
+	workDir = normalizeWorkspacePath(workDir)
+	if info, err := os.Stat(workDir); err != nil || !info.IsDir() {
+		return nil, nil, "", errors.New(e.i18n.Tf(MsgDirInvalidPath, workDir))
+	}
+
+	if e.multiWorkspace {
+		targetAgent, targetSessions, err := e.getOrCreateWorkspaceAgent(workDir)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		e.bindSendWorkDir(msg.SessionKey, workDir)
+		if e.projectState != nil {
+			e.projectState.SetWorkspaceDirOverride(interactiveKey, workDir)
+			e.projectState.Save()
+		}
+		return targetAgent, targetSessions, workDir + ":" + msg.SessionKey, nil
+	}
+
+	switcher, ok := agent.(WorkDirSwitcher)
+	if !ok {
+		return nil, nil, "", errors.New(e.i18n.T(MsgDirNotSupported))
+	}
+	switcher.SetWorkDir(workDir)
+	if e.projectState != nil {
+		e.projectState.SetWorkDirOverride(workDir)
+		e.projectState.Save()
+	}
+	return agent, sessions, interactiveKey, nil
 }
 
 // matchSession resolves a user query to an agent session. Priority:
