@@ -403,6 +403,123 @@ func TestAppServerSession_ResumeDoesNotRequestExtendedHistory(t *testing.T) {
 	}
 }
 
+func TestAppServerSession_ResumeTakesOverActiveWriter(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stdin := &lockedWriteCloser{}
+	preempted := ""
+	s := &appServerSession{
+		ctx:     ctx,
+		stdin:   stdin,
+		pending: make(map[int64]chan rpcResponseEnvelope),
+		preemptWriter: func(threadID string) error {
+			preempted = threadID
+			return nil
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.ensureThread("thread-active")
+	}()
+
+	line := waitForWrittenJSONLineAt(t, stdin, 0)
+	var first struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(line), &first); err != nil {
+		t.Fatalf("decode first request %q: %v", line, err)
+	}
+	s.handleResponse(rpcResponseEnvelope{
+		ID: first.ID,
+		Error: &rpcError{
+			Code:    -32600,
+			Message: "thread-store conflict: already has an active writer",
+		},
+	})
+
+	line = waitForWrittenJSONLineAt(t, stdin, 1)
+	var second struct {
+		ID     int64          `json:"id"`
+		Method string         `json:"method"`
+		Params map[string]any `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(line), &second); err != nil {
+		t.Fatalf("decode retry request %q: %v", line, err)
+	}
+	if second.Method != "thread/resume" {
+		t.Fatalf("retry method = %q, want thread/resume", second.Method)
+	}
+	if second.Params["threadId"] != "thread-active" {
+		t.Fatalf("retry threadId = %#v, want thread-active", second.Params["threadId"])
+	}
+	s.handleResponse(rpcResponseEnvelope{
+		ID:     second.ID,
+		Result: json.RawMessage(`{"cwd":"/tmp/project","thread":{"id":"thread-active"}}`),
+	})
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ensureThread() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for resumed thread")
+	}
+	if preempted != "thread-active" {
+		t.Fatalf("preempted thread = %q, want thread-active", preempted)
+	}
+}
+
+func TestAppServerSession_ResumeDoesNotTakeOverOtherError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stdin := &lockedWriteCloser{}
+	preemptCalls := 0
+	s := &appServerSession{
+		ctx:     ctx,
+		stdin:   stdin,
+		pending: make(map[int64]chan rpcResponseEnvelope),
+		preemptWriter: func(string) error {
+			preemptCalls++
+			return nil
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.ensureThread("thread-error")
+	}()
+	line := waitForWrittenJSONLineAt(t, stdin, 0)
+	var request struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(line), &request); err != nil {
+		t.Fatalf("decode request %q: %v", line, err)
+	}
+	s.handleResponse(rpcResponseEnvelope{
+		ID: request.ID,
+		Error: &rpcError{
+			Code:    -32000,
+			Message: "provider unavailable",
+		},
+	})
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "provider unavailable") {
+			t.Fatalf("ensureThread() error = %v, want provider unavailable", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for failed resume")
+	}
+	if preemptCalls != 0 {
+		t.Fatalf("preempt calls = %d, want 0", preemptCalls)
+	}
+}
+
 func TestMapAppServerRateLimits_PrefersMultiBucketView(t *testing.T) {
 	report := mapAppServerRateLimits(appServerRateLimitsResponse{
 		RateLimits: appServerRateLimitSnapshot{
@@ -1101,6 +1218,10 @@ func appServerPendingMessages(s *appServerSession) []string {
 }
 
 func waitForWrittenJSONLine(t *testing.T, w *lockedWriteCloser) string {
+	return waitForWrittenJSONLineAt(t, w, 0)
+}
+
+func waitForWrittenJSONLineAt(t *testing.T, w *lockedWriteCloser, index int) string {
 	t.Helper()
 	deadline := time.After(time.Second)
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -1110,10 +1231,15 @@ func waitForWrittenJSONLine(t *testing.T, w *lockedWriteCloser) string {
 		case <-deadline:
 			t.Fatalf("timed out waiting for JSON response, buffer=%q", w.String())
 		case <-ticker.C:
-			for _, line := range strings.Split(w.String(), "\n") {
+			lines := strings.Split(w.String(), "\n")
+			seen := 0
+			for _, line := range lines {
 				line = strings.TrimSpace(line)
 				if line != "" {
-					return line
+					if seen == index {
+						return line
+					}
+					seen++
 				}
 			}
 		}

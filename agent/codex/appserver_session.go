@@ -35,6 +35,13 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
+func (e *rpcError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.Message)
+}
+
 type initResponse struct {
 	ProtocolVersion string `json:"protocolVersion"`
 }
@@ -163,6 +170,7 @@ type appServerSession struct {
 	extraEnv          []string
 	codexHome         string
 	promptPreamble    string
+	preemptWriter     func(threadID string) error
 
 	events       chan core.Event
 	eventsMu     sync.RWMutex // publishers share the lock; Close owns channel closure
@@ -224,12 +232,15 @@ func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []stri
 		extraEnv:          append([]string(nil), extraEnv...),
 		codexHome:         strings.TrimSpace(codexHome),
 		promptPreamble:    buildCodexPromptPreamble(systemPrompt, appendPrompt),
-		events:            make(chan core.Event, 128),
-		ctx:               sessionCtx,
-		cancel:            cancel,
-		pending:           make(map[int64]chan rpcResponseEnvelope),
-		pendingApprovals:  make(map[string]chan core.PermissionResult),
-		preambleSent:      resumeID != "" && resumeID != core.ContinueSession,
+		preemptWriter: func(threadID string) error {
+			return preemptCodexThreadWriter(codexHome, threadID)
+		},
+		events:           make(chan core.Event, 128),
+		ctx:              sessionCtx,
+		cancel:           cancel,
+		pending:          make(map[int64]chan rpcResponseEnvelope),
+		pendingApprovals: make(map[string]chan core.PermissionResult),
+		preambleSent:     resumeID != "" && resumeID != core.ContinueSession,
 	}
 	s.alive.Store(true)
 
@@ -376,7 +387,16 @@ func (s *appServerSession) ensureThread(resumeID string) error {
 
 		var resp threadResumeResponse
 		if err := s.request("thread/resume", params, &resp); err != nil {
-			return err
+			if !isActiveWriterError(err) || s.preemptWriter == nil {
+				return err
+			}
+			if preemptErr := s.preemptWriter(resumeID); preemptErr != nil {
+				slog.Warn("codex app-server: unable to preempt active thread writer", "thread_id", resumeID, "error", preemptErr)
+				return err
+			}
+			if err := s.request("thread/resume", params, &resp); err != nil {
+				return err
+			}
 		}
 		if resp.Thread.ID == "" {
 			return fmt.Errorf("codex app-server resume returned empty thread id")
@@ -404,6 +424,10 @@ func (s *appServerSession) ensureThread(resumeID string) error {
 	s.threadID.Store(resp.Thread.ID)
 	slog.Info("codex app-server thread started", "thread_id", resp.Thread.ID)
 	return nil
+}
+
+func isActiveWriterError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "already has an active writer")
 }
 
 // validatePermissionProfile rejects ignored or replaced profiles, including older servers that do not support the field.
@@ -1814,7 +1838,7 @@ func (s *appServerSession) requestWithTimeout(method string, params any, out any
 	select {
 	case resp := <-ch:
 		if resp.Error != nil {
-			return fmt.Errorf("%s", strings.TrimSpace(resp.Error.Message))
+			return resp.Error
 		}
 		if out != nil {
 			if err := json.Unmarshal(resp.Result, out); err != nil {
