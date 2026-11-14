@@ -106,6 +106,46 @@ func TestPreemptCodexThreadWriter_DoesNotKillSharedWriter(t *testing.T) {
 	waitForWriterHelperExit(t, cmd)
 }
 
+func TestPreemptCodexThreadWriter_DelegatesManagedDaemon(t *testing.T) {
+	home := t.TempDir()
+	lockDir := filepath.Join(home, "thread-writer-locks")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(lockDir, "thread-daemon.lock")
+	other := filepath.Join(lockDir, "other.lock")
+	for _, path := range []string{target, other} {
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := startWriterLockHelper(t, target, other)
+
+	old := preemptManagedDaemonThread
+	oldDetector := managedCodexDaemonDetector
+	defer func() {
+		preemptManagedDaemonThread = old
+		managedCodexDaemonDetector = oldDetector
+	}()
+	managedCodexDaemonDetector = func(int, []byte) bool { return true }
+	var gotHome, gotThread string
+	preemptManagedDaemonThread = func(codexHome, threadID string) error {
+		gotHome, gotThread = codexHome, threadID
+		return nil
+	}
+	if err := preemptCodexThreadWriter(home, "thread-daemon"); err != nil {
+		t.Fatalf("preemptCodexThreadWriter() error = %v", err)
+	}
+	if gotHome != home || gotThread != "thread-daemon" {
+		t.Fatalf("managed daemon delegation = (%q, %q), want (%q, %q)", gotHome, gotThread, home, "thread-daemon")
+	}
+	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("managed daemon was terminated: %v", err)
+	}
+	_ = cmd.Process.Kill()
+	waitForWriterHelperExit(t, cmd)
+}
+
 func TestWriterPreemptHelper(t *testing.T) {
 	if os.Getenv("CC_WRITER_HELPER") != "1" {
 		return

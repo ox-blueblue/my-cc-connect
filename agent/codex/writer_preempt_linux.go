@@ -24,11 +24,15 @@ const (
 	writerForcedKillWaitTime = 750 * time.Millisecond
 )
 
+var preemptManagedDaemonThread = preemptCodexThreadViaDaemon
+var managedCodexDaemonDetector = isManagedCodexDaemon
+
 type procLock struct {
 	device string
 	inode  uint64
 	pid    int
 	start  uint64
+	count  int
 }
 
 func parseProcLocks(data []byte) []procLock {
@@ -105,6 +109,18 @@ func isCodexProcess(pid int, cmdline []byte) bool {
 	return err == nil && isCodexExecutablePath(executable)
 }
 
+func isManagedCodexDaemon(pid int, cmdline []byte) bool {
+	if !isCodexProcess(pid, cmdline) {
+		return false
+	}
+	for _, arg := range strings.Split(string(cmdline), "\x00") {
+		if arg == "--managed-daemon" {
+			return true
+		}
+	}
+	return false
+}
+
 func preemptCodexThreadWriter(codexHome, threadID string) error {
 	if strings.TrimSpace(threadID) == "" || strings.ContainsAny(threadID, `/\`) {
 		return fmt.Errorf("codex writer preemption: invalid thread id")
@@ -116,6 +132,23 @@ func preemptCodexThreadWriter(codexHome, threadID string) error {
 	}
 	if err := validateWriterOwner(owner); err != nil {
 		return err
+	}
+	if owner.count != 1 {
+		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", owner.pid))
+		if err != nil {
+			return fmt.Errorf("codex writer preemption: read pid %d command line: %w", owner.pid, err)
+		}
+		if !managedCodexDaemonDetector(owner.pid, cmdline) {
+			return fmt.Errorf("codex writer preemption: pid %d owns multiple thread locks", owner.pid)
+		}
+		confirmed, err := inspectWriterLock(lockPath)
+		if err != nil {
+			return err
+		}
+		if confirmed != owner {
+			return fmt.Errorf("codex writer preemption: target writer changed before daemon takeover")
+		}
+		return preemptManagedDaemonThread(codexHome, threadID)
 	}
 
 	// Re-read the lock immediately before signaling to avoid killing a PID
@@ -212,9 +245,7 @@ func inspectWriterLock(lockPath string) (procLock, error) {
 	if !ok {
 		return procLock{}, fmt.Errorf("codex writer preemption: no active owner for %s", lockPath)
 	}
-	if countProcLocksForPID(locks, pid) != 1 {
-		return procLock{}, fmt.Errorf("codex writer preemption: pid %d owns multiple thread locks", pid)
-	}
+	lockCount := countProcLocksForPID(locks, pid)
 	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
 		return procLock{}, fmt.Errorf("codex writer preemption: read pid %d command line: %w", pid, err)
@@ -226,7 +257,7 @@ func inspectWriterLock(lockPath string) (procLock, error) {
 	if err != nil {
 		return procLock{}, fmt.Errorf("codex writer preemption: read pid %d identity: %w", pid, err)
 	}
-	return procLock{device: device, inode: stat.Ino, pid: pid, start: start}, nil
+	return procLock{device: device, inode: stat.Ino, pid: pid, start: start, count: lockCount}, nil
 }
 
 func readProcessStartTime(pid int) (uint64, error) {
