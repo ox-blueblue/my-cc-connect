@@ -159,7 +159,7 @@ func (cs *codexSession) Send(prompt string, messageID string, images []core.Imag
 		prompt = prependCodexPromptPreamble(prompt, cs.promptPreamble)
 	} else if cs.preemptWriter != nil {
 		if err := cs.preemptWriter(cs.CurrentSessionID()); err != nil {
-			slog.Debug("codexSession: active writer preemption skipped", "thread_id", cs.CurrentSessionID(), "error", err)
+			slog.Warn("codexSession: active writer preemption skipped", "thread_id", cs.CurrentSessionID(), "error", err)
 		}
 	}
 	args := cs.buildExecArgs(prompt, imagePaths)
