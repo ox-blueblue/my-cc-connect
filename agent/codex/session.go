@@ -34,6 +34,7 @@ type codexSession struct {
 	cliExtraArgs   []string // extra args from cmd, prepended before exec args
 	extraEnv       []string
 	promptPreamble string
+	preemptWriter  func(threadID string) error
 	events         chan core.Event
 	threadID       atomic.Value // stores string — Codex thread_id
 	ctx            context.Context
@@ -93,6 +94,7 @@ func prependCodexPromptPreamble(prompt string, preamble string) string {
 
 func newCodexSession(ctx context.Context, cliBin string, cliExtraArgs []string, workDir, model, effort, mode, resumeID, baseURL string, extraEnv []string, modelProvider string, systemPrompt string, appendPrompt string) (*codexSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
+	preemptHome := effectiveCodexHome("", extraEnv, workDir)
 
 	cs := &codexSession{
 		workDir:        workDir,
@@ -105,10 +107,13 @@ func newCodexSession(ctx context.Context, cliBin string, cliExtraArgs []string, 
 		cliExtraArgs:   cliExtraArgs,
 		extraEnv:       extraEnv,
 		promptPreamble: buildCodexPromptPreamble(systemPrompt, appendPrompt),
-		events:         make(chan core.Event, 64),
-		ctx:            sessionCtx,
-		cancel:         cancel,
-		cmds:           make(map[*exec.Cmd]struct{}),
+		preemptWriter: func(threadID string) error {
+			return preemptCodexThreadWriter(preemptHome, threadID)
+		},
+		events: make(chan core.Event, 64),
+		ctx:    sessionCtx,
+		cancel: cancel,
+		cmds:   make(map[*exec.Cmd]struct{}),
 	}
 	cs.alive.Store(true)
 
@@ -152,6 +157,10 @@ func (cs *codexSession) Send(prompt string, messageID string, images []core.Imag
 	isResume := cs.CurrentSessionID() != ""
 	if !isResume {
 		prompt = prependCodexPromptPreamble(prompt, cs.promptPreamble)
+	} else if cs.preemptWriter != nil {
+		if err := cs.preemptWriter(cs.CurrentSessionID()); err != nil {
+			slog.Warn("codexSession: active writer preemption skipped", "thread_id", cs.CurrentSessionID(), "error", err)
+		}
 	}
 	args := cs.buildExecArgs(prompt, imagePaths)
 	if len(cs.cliExtraArgs) > 0 {

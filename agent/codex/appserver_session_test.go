@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -400,6 +401,144 @@ func TestAppServerSession_ResumeDoesNotRequestExtendedHistory(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for thread resume")
+	}
+}
+
+func TestAppServerSession_ResumeTakesOverActiveWriter(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stdin := &lockedWriteCloser{}
+	preempted := ""
+	s := &appServerSession{
+		ctx:     ctx,
+		stdin:   stdin,
+		pending: make(map[int64]chan rpcResponseEnvelope),
+		preemptWriter: func(threadID string) error {
+			preempted = threadID
+			return nil
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.ensureThread("thread-active")
+	}()
+
+	line := waitForWrittenJSONLineAt(t, stdin, 0)
+	var first struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(line), &first); err != nil {
+		t.Fatalf("decode first request %q: %v", line, err)
+	}
+	s.handleResponse(rpcResponseEnvelope{
+		ID: first.ID,
+		Error: &rpcError{
+			Code:    -32600,
+			Message: "thread-store conflict: already has an active writer",
+		},
+	})
+
+	line = waitForWrittenJSONLineAt(t, stdin, 1)
+	var second struct {
+		ID     int64          `json:"id"`
+		Method string         `json:"method"`
+		Params map[string]any `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(line), &second); err != nil {
+		t.Fatalf("decode retry request %q: %v", line, err)
+	}
+	if second.Method != "thread/resume" {
+		t.Fatalf("retry method = %q, want thread/resume", second.Method)
+	}
+	if second.Params["threadId"] != "thread-active" {
+		t.Fatalf("retry threadId = %#v, want thread-active", second.Params["threadId"])
+	}
+	s.handleResponse(rpcResponseEnvelope{
+		ID:     second.ID,
+		Result: json.RawMessage(`{"cwd":"/tmp/project","thread":{"id":"thread-active"}}`),
+	})
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ensureThread() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for resumed thread")
+	}
+	if preempted != "thread-active" {
+		t.Fatalf("preempted thread = %q, want thread-active", preempted)
+	}
+}
+
+func TestAppServerSession_ResumeDoesNotTakeOverOtherError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stdin := &lockedWriteCloser{}
+	preemptCalls := 0
+	s := &appServerSession{
+		ctx:     ctx,
+		stdin:   stdin,
+		pending: make(map[int64]chan rpcResponseEnvelope),
+		preemptWriter: func(string) error {
+			preemptCalls++
+			return nil
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.ensureThread("thread-error")
+	}()
+	line := waitForWrittenJSONLineAt(t, stdin, 0)
+	var request struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(line), &request); err != nil {
+		t.Fatalf("decode request %q: %v", line, err)
+	}
+	s.handleResponse(rpcResponseEnvelope{
+		ID: request.ID,
+		Error: &rpcError{
+			Code:    -32000,
+			Message: "already has an active writer",
+		},
+	})
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "already has an active writer") {
+			t.Fatalf("ensureThread() error = %v, want active-writer error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for failed resume")
+	}
+	if preemptCalls != 0 {
+		t.Fatalf("preempt calls = %d, want 0", preemptCalls)
+	}
+}
+
+func TestEffectiveCodexHome(t *testing.T) {
+	workDir := t.TempDir()
+	cases := []struct {
+		name       string
+		explicit   string
+		extraEnv   []string
+		wantSuffix string
+	}{
+		{name: "explicit wins", explicit: "/explicit/codex", extraEnv: []string{"CODEX_HOME=/env/codex"}, wantSuffix: "/explicit/codex"},
+		{name: "environment fallback", extraEnv: []string{"CODEX_HOME=/env/codex"}, wantSuffix: "/env/codex"},
+		{name: "relative environment uses work dir", extraEnv: []string{"CODEX_HOME=relative/codex"}, wantSuffix: filepath.Join(workDir, "relative/codex")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveCodexHome(tc.explicit, tc.extraEnv, workDir); got != tc.wantSuffix {
+				t.Fatalf("effectiveCodexHome() = %q, want %q", got, tc.wantSuffix)
+			}
+		})
 	}
 }
 
@@ -1101,6 +1240,10 @@ func appServerPendingMessages(s *appServerSession) []string {
 }
 
 func waitForWrittenJSONLine(t *testing.T, w *lockedWriteCloser) string {
+	return waitForWrittenJSONLineAt(t, w, 0)
+}
+
+func waitForWrittenJSONLineAt(t *testing.T, w *lockedWriteCloser, index int) string {
 	t.Helper()
 	deadline := time.After(time.Second)
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -1110,10 +1253,15 @@ func waitForWrittenJSONLine(t *testing.T, w *lockedWriteCloser) string {
 		case <-deadline:
 			t.Fatalf("timed out waiting for JSON response, buffer=%q", w.String())
 		case <-ticker.C:
-			for _, line := range strings.Split(w.String(), "\n") {
+			lines := strings.Split(w.String(), "\n")
+			seen := 0
+			for _, line := range lines {
 				line = strings.TrimSpace(line)
 				if line != "" {
-					return line
+					if seen == index {
+						return line
+					}
+					seen++
 				}
 			}
 		}
