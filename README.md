@@ -337,7 +337,7 @@ npm install -g cc-connect
 # Homebrew (macOS / Linux)
 brew install cc-connect
 
-# Or download a binary from https://github.com/chenhg5/cc-connect/releases
+# Or download a binary from https://github.com/ox-blueblue/my-cc-connect/releases
 ```
 
 ### 4️⃣ Start cc-connect and open the Web UI
@@ -371,7 +371,7 @@ That's it — send a message to your bot and cc-connect will relay it to your lo
 > **The easiest way** — Send this to Claude Code or any AI coding agent, and it will handle the entire installation and configuration for you:
 
 ```bash
-Follow https://raw.githubusercontent.com/chenhg5/cc-connect/refs/heads/main/INSTALL.md to install and configure cc-connect.
+Follow https://raw.githubusercontent.com/ox-blueblue/my-cc-connect/refs/heads/main/INSTALL.md to install and configure cc-connect.
 ```
 
 
@@ -389,11 +389,11 @@ npm install -g cc-connect
 brew install cc-connect
 ```
 
-**Download binary from [GitHub Releases](https://github.com/chenhg5/cc-connect/releases):**
+**Download binary from [GitHub Releases](https://github.com/ox-blueblue/my-cc-connect/releases):**
 
 ```bash
 # Linux amd64 - Stable
-curl -L -o cc-connect https://github.com/chenhg5/cc-connect/releases/latest/download/cc-connect-linux-amd64
+curl -L -o cc-connect https://github.com/ox-blueblue/my-cc-connect/releases/latest/download/cc-connect-linux-amd64
 chmod +x cc-connect
 sudo mv cc-connect /usr/local/bin/
 
@@ -402,7 +402,7 @@ sudo mv cc-connect /usr/local/bin/
 **Build from source (requires Go 1.22+):**
 
 ```bash
-git clone https://github.com/chenhg5/cc-connect.git
+git clone https://github.com/ox-blueblue/my-cc-connect.git
 cd cc-connect
 make build
 ```
