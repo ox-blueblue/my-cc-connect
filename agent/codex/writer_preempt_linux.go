@@ -4,6 +4,7 @@ package codex
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -25,11 +28,12 @@ type procLock struct {
 	device string
 	inode  uint64
 	pid    int
+	start  uint64
 }
 
 func parseProcLocks(data []byte) []procLock {
 	var locks []procLock
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 7 {
@@ -44,11 +48,19 @@ func parseProcLocks(data []byte) []procLock {
 		if err != nil || pid <= 0 {
 			continue
 		}
-		inode, err := strconv.ParseUint(fields[6], 10, 64)
+		deviceParts := strings.Split(fields[5], ":")
+		if len(deviceParts) != 3 {
+			continue
+		}
+		inode, err := strconv.ParseUint(deviceParts[2], 10, 64)
 		if err != nil {
 			continue
 		}
-		locks = append(locks, procLock{device: fields[5], inode: inode, pid: pid})
+		locks = append(locks, procLock{
+			device: deviceParts[0] + ":" + deviceParts[1],
+			inode:  inode,
+			pid:    pid,
+		})
 	}
 	return locks
 }
@@ -77,8 +89,20 @@ func isCodexProcessCmdline(cmdline []byte) bool {
 	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
 		return false
 	}
-	name := strings.ToLower(filepath.Base(strings.TrimSpace(args[0])))
-	return strings.Contains(name, "codex")
+	return isCodexExecutablePath(args[0])
+}
+
+func isCodexExecutablePath(path string) bool {
+	name := strings.ToLower(filepath.Base(strings.TrimSpace(path)))
+	return name == "codex" || name == "codex.exe"
+}
+
+func isCodexProcess(pid int, cmdline []byte) bool {
+	if !isCodexProcessCmdline(cmdline) {
+		return false
+	}
+	executable, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	return err == nil && isCodexExecutablePath(executable)
 }
 
 func preemptCodexThreadWriter(codexHome, threadID string) error {
@@ -104,27 +128,61 @@ func preemptCodexThreadWriter(codexHome, threadID string) error {
 		return fmt.Errorf("codex writer preemption: target writer changed before termination")
 	}
 
-	process, err := os.FindProcess(owner.pid)
+	pidfd, err := unix.PidfdOpen(owner.pid, 0)
 	if err != nil {
-		return fmt.Errorf("codex writer preemption: find pid %d: %w", owner.pid, err)
+		return fmt.Errorf("codex writer preemption: open stable pid handle %d: %w", owner.pid, err)
 	}
-	if err := process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("codex writer preemption: stop pid %d: %w", owner.pid, err)
+	defer unix.Close(pidfd)
+	start, err := readProcessStartTime(owner.pid)
+	if err != nil {
+		return fmt.Errorf("codex writer preemption: read pid %d identity: %w", owner.pid, err)
+	}
+	if start != owner.start {
+		return fmt.Errorf("codex writer preemption: target writer changed before freeze")
+	}
+	if err := unix.PidfdSendSignal(pidfd, unix.SIGSTOP, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("codex writer preemption: freeze pid %d: %w", owner.pid, err)
+	}
+
+	// Keep the verified process stopped while checking ownership one final time.
+	// This prevents it from acquiring another thread lock between validation and
+	// termination, which would make a process-level kill affect another session.
+	confirmed, err = inspectWriterLock(lockPath)
+	if err != nil {
+		_ = unix.PidfdSendSignal(pidfd, unix.SIGCONT, nil, 0)
+		return err
+	}
+	if confirmed != owner {
+		_ = unix.PidfdSendSignal(pidfd, unix.SIGCONT, nil, 0)
+		return fmt.Errorf("codex writer preemption: target writer changed before force termination")
+	}
+	if err := unix.PidfdSendSignal(pidfd, unix.SIGTERM, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+		_ = unix.PidfdSendSignal(pidfd, unix.SIGCONT, nil, 0)
+		return fmt.Errorf("codex writer preemption: request graceful stop for pid %d: %w", owner.pid, err)
+	}
+	if err := unix.PidfdSendSignal(pidfd, unix.SIGCONT, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("codex writer preemption: resume pid %d for graceful stop: %w", owner.pid, err)
 	}
 	if released, err := waitForWriterRelease(owner, writerGracePeriod); err != nil {
 		return err
 	} else if released {
 		return nil
 	}
-
+	if err := unix.PidfdSendSignal(pidfd, unix.SIGSTOP, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("codex writer preemption: refreeze pid %d: %w", owner.pid, err)
+	}
+	// Re-check process identity and lock ownership after the graceful-stop
+	// window, while the process is stopped again.
 	confirmed, err = inspectWriterLock(lockPath)
 	if err != nil {
+		_ = unix.PidfdSendSignal(pidfd, unix.SIGCONT, nil, 0)
 		return err
 	}
 	if confirmed != owner {
+		_ = unix.PidfdSendSignal(pidfd, unix.SIGCONT, nil, 0)
 		return fmt.Errorf("codex writer preemption: target writer changed before force termination")
 	}
-	if err := process.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+	if err := unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
 		return fmt.Errorf("codex writer preemption: force stop pid %d: %w", owner.pid, err)
 	}
 	if released, err := waitForWriterRelease(owner, writerForcedKillWaitTime); err != nil {
@@ -161,14 +219,38 @@ func inspectWriterLock(lockPath string) (procLock, error) {
 	if err != nil {
 		return procLock{}, fmt.Errorf("codex writer preemption: read pid %d command line: %w", pid, err)
 	}
-	if !isCodexProcessCmdline(cmdline) {
+	if !isCodexProcess(pid, cmdline) {
 		return procLock{}, fmt.Errorf("codex writer preemption: pid %d is not a Codex process", pid)
 	}
-	return procLock{device: device, inode: stat.Ino, pid: pid}, nil
+	start, err := readProcessStartTime(pid)
+	if err != nil {
+		return procLock{}, fmt.Errorf("codex writer preemption: read pid %d identity: %w", pid, err)
+	}
+	return procLock{device: device, inode: stat.Ino, pid: pid, start: start}, nil
+}
+
+func readProcessStartTime(pid int) (uint64, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, err
+	}
+	end := strings.LastIndexByte(string(data), ')')
+	if end < 0 {
+		return 0, fmt.Errorf("malformed process stat")
+	}
+	fields := strings.Fields(string(data)[end+1:])
+	if len(fields) <= 19 {
+		return 0, fmt.Errorf("malformed process stat")
+	}
+	start, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse process start time: %w", err)
+	}
+	return start, nil
 }
 
 func validateWriterOwner(owner procLock) error {
-	if owner.pid <= 0 || owner.device == "" || owner.inode == 0 {
+	if owner.pid <= 0 || owner.device == "" || owner.inode == 0 || owner.start == 0 {
 		return fmt.Errorf("codex writer preemption: invalid writer owner")
 	}
 	return nil
@@ -189,6 +271,13 @@ func waitForWriterRelease(owner procLock, timeout time.Duration) (bool, error) {
 		if pid != owner.pid || countProcLocksForPID(locks, pid) != 1 {
 			return false, fmt.Errorf("codex writer preemption: target lock ownership changed while waiting")
 		}
+		start, err := readProcessStartTime(pid)
+		if err != nil {
+			return false, fmt.Errorf("codex writer preemption: read pid %d identity while waiting: %w", pid, err)
+		}
+		if start != owner.start {
+			return false, fmt.Errorf("codex writer preemption: target process changed while waiting")
+		}
 		if time.Now().After(deadline) {
 			return false, nil
 		}
@@ -199,5 +288,5 @@ func waitForWriterRelease(owner procLock, timeout time.Duration) (bool, error) {
 func linuxLockDevice(dev uint64) string {
 	major := (dev >> 8) & 0xfff
 	minor := (dev & 0xff) | ((dev >> 12) & 0xfff00)
-	return fmt.Sprintf("%x:%x", major, minor)
+	return fmt.Sprintf("%02x:%02x", major, minor)
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -503,20 +504,41 @@ func TestAppServerSession_ResumeDoesNotTakeOverOtherError(t *testing.T) {
 		ID: request.ID,
 		Error: &rpcError{
 			Code:    -32000,
-			Message: "provider unavailable",
+			Message: "already has an active writer",
 		},
 	})
 
 	select {
 	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "provider unavailable") {
-			t.Fatalf("ensureThread() error = %v, want provider unavailable", err)
+		if err == nil || !strings.Contains(err.Error(), "already has an active writer") {
+			t.Fatalf("ensureThread() error = %v, want active-writer error", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for failed resume")
 	}
 	if preemptCalls != 0 {
 		t.Fatalf("preempt calls = %d, want 0", preemptCalls)
+	}
+}
+
+func TestEffectiveCodexHome(t *testing.T) {
+	workDir := t.TempDir()
+	cases := []struct {
+		name       string
+		explicit   string
+		extraEnv   []string
+		wantSuffix string
+	}{
+		{name: "explicit wins", explicit: "/explicit/codex", extraEnv: []string{"CODEX_HOME=/env/codex"}, wantSuffix: "/explicit/codex"},
+		{name: "environment fallback", extraEnv: []string{"CODEX_HOME=/env/codex"}, wantSuffix: "/env/codex"},
+		{name: "relative environment uses work dir", extraEnv: []string{"CODEX_HOME=relative/codex"}, wantSuffix: filepath.Join(workDir, "relative/codex")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveCodexHome(tc.explicit, tc.extraEnv, workDir); got != tc.wantSuffix {
+				t.Fatalf("effectiveCodexHome() = %q, want %q", got, tc.wantSuffix)
+			}
+		})
 	}
 }
 

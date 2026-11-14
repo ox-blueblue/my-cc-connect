@@ -218,6 +218,7 @@ const (
 // newAppServerSession connects to Codex and verifies the requested permissions before returning a usable session.
 func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []string, url, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, extraEnv []string, codexHome string, systemPrompt string, appendPrompt string, permissionProfile string) (*appServerSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
+	preemptHome := effectiveCodexHome(codexHome, extraEnv, workDir)
 	s := &appServerSession{
 		cliBin:            cliBin,
 		cliExtraArgs:      append([]string(nil), cliExtraArgs...),
@@ -233,7 +234,7 @@ func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []stri
 		codexHome:         strings.TrimSpace(codexHome),
 		promptPreamble:    buildCodexPromptPreamble(systemPrompt, appendPrompt),
 		preemptWriter: func(threadID string) error {
-			return preemptCodexThreadWriter(codexHome, threadID)
+			return preemptCodexThreadWriter(preemptHome, threadID)
 		},
 		events:           make(chan core.Event, 128),
 		ctx:              sessionCtx,
@@ -263,6 +264,24 @@ func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []stri
 	}
 
 	return s, nil
+}
+
+func effectiveCodexHome(explicit string, extraEnv []string, workDir string) string {
+	home := strings.TrimSpace(explicit)
+	if home == "" {
+		home = getenvFromList(extraEnv, "CODEX_HOME")
+	}
+	if home == "" || filepath.IsAbs(home) {
+		return home
+	}
+	base := strings.TrimSpace(workDir)
+	if base == "" {
+		base = "."
+	}
+	if resolved, err := filepath.Abs(filepath.Join(base, home)); err == nil {
+		return resolved
+	}
+	return filepath.Clean(filepath.Join(base, home))
 }
 
 // appServerListenURL returns the --listen value for the spawn. A stdio
@@ -427,7 +446,14 @@ func (s *appServerSession) ensureThread(resumeID string) error {
 }
 
 func isActiveWriterError(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "already has an active writer")
+	if err == nil {
+		return false
+	}
+	rpcErr, ok := err.(*rpcError)
+	if !ok || rpcErr.Code != -32600 {
+		return false
+	}
+	return strings.Contains(strings.ToLower(rpcErr.Message), "already has an active writer")
 }
 
 // validatePermissionProfile rejects ignored or replaced profiles, including older servers that do not support the field.
