@@ -336,7 +336,7 @@ npm install -g cc-connect
 # Homebrew（macOS / Linux）
 brew install cc-connect
 
-# 也可以从 https://github.com/chenhg5/cc-connect/releases 直接下载二进制
+# 也可以从 https://github.com/ox-blueblue/my-cc-connect/releases 直接下载二进制
 ```
 
 ### 4️⃣ 启动 cc-connect 并打开 Web UI
@@ -370,7 +370,7 @@ Web admin:  http://localhost:9820
 > **最简单的方式** — 把这段话发给 Claude Code 或其他 AI 编码 Agent，它会帮你完成整个安装和配置过程：
 
 ```bash
-请参考 https://raw.githubusercontent.com/chenhg5/cc-connect/refs/heads/main/INSTALL.md 帮我安装和配置 cc-connect
+请参考 https://raw.githubusercontent.com/ox-blueblue/my-cc-connect/refs/heads/main/INSTALL.md 帮我安装和配置 cc-connect
 ```
 
 
@@ -388,11 +388,11 @@ Web admin:  http://localhost:9820
 brew install cc-connect
 ```
 
-**从 [GitHub Releases](https://github.com/chenhg5/cc-connect/releases) 下载：**
+**从 [GitHub Releases](https://github.com/ox-blueblue/my-cc-connect/releases) 下载：**
 
 ```bash
 # Linux amd64 - 稳定版
-curl -L -o cc-connect https://github.com/chenhg5/cc-connect/releases/latest/download/cc-connect-linux-amd64
+curl -L -o cc-connect https://github.com/ox-blueblue/my-cc-connect/releases/latest/download/cc-connect-linux-amd64
 chmod +x cc-connect
 sudo mv cc-connect /usr/local/bin/
 
@@ -401,7 +401,7 @@ sudo mv cc-connect /usr/local/bin/
 **从源码编译（需要 Go 1.22+）：**
 
 ```bash
-git clone https://github.com/chenhg5/cc-connect.git
+git clone https://github.com/ox-blueblue/my-cc-connect.git
 cd cc-connect
 make build
 ```
