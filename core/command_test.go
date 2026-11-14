@@ -1,10 +1,152 @@
 package core
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
+
+type allSessionsCommandAgent struct {
+	stubAgent
+	sessions []AgentSessionInfo
+}
+
+func (a *allSessionsCommandAgent) ListAllSessions(context.Context) ([]AgentSessionInfo, error) {
+	return a.sessions, nil
+}
+
+type switchAgentsCommandAgent struct {
+	stubAgent
+	workDir string
+	all     []AgentSessionInfo
+}
+
+func (a *switchAgentsCommandAgent) GetWorkDir() string { return a.workDir }
+func (a *switchAgentsCommandAgent) SetWorkDir(dir string) {
+	a.workDir = dir
+}
+func (a *switchAgentsCommandAgent) ListAllSessions(context.Context) ([]AgentSessionInfo, error) {
+	return a.all, nil
+}
+
+func TestSwitchByAgentsIndexChangesSessionAndWorkDir(t *testing.T) {
+	baseDir := t.TempDir()
+	targetDir := t.TempDir()
+	agent := &switchAgentsCommandAgent{
+		workDir: baseDir,
+		all: []AgentSessionInfo{
+			{ID: "codex-1", Summary: "first", WorkDir: baseDir, MessageCount: 1},
+			{ID: "codex-2", Summary: "second", WorkDir: targetDir, MessageCount: 2},
+		},
+	}
+	p := &stubPlatformEngine{n: "feishu"}
+	state := NewProjectStateStore(filepath.Join(t.TempDir(), "state.json"))
+	e := NewEngine("test", agent, []Platform{p}, "", LangChinese)
+	e.SetProjectStateStore(state)
+	defer e.cancel()
+
+	msg := &Message{SessionKey: "feishu:chat:user", UserID: "u1", ReplyCtx: "ctx"}
+	if !e.handleCommand(p, msg, "/switch 2") {
+		t.Fatal("/switch 2 should be handled")
+	}
+	if got := agent.GetWorkDir(); got != targetDir {
+		t.Fatalf("work directory = %q, want %q", got, targetDir)
+	}
+	if got := e.sessions.GetOrCreateActive(msg.SessionKey).GetAgentSessionID(); got != "codex-2" {
+		t.Fatalf("active session ID = %q, want codex-2", got)
+	}
+	if got := state.WorkDirOverride(); got != targetDir {
+		t.Fatalf("persisted work directory = %q, want %q", got, targetDir)
+	}
+}
+
+func TestHelpListsSlashSwitchAndAgentsCommands(t *testing.T) {
+	p := &stubPlatformEngine{n: "feishu"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangChinese)
+	defer e.cancel()
+	e.cmdHelp(p, &Message{SessionKey: "feishu:chat:user", ReplyCtx: "ctx"})
+
+	sent := p.getSent()
+	if len(sent) != 1 {
+		t.Fatalf("help replies = %d, want 1", len(sent))
+	}
+	for _, want := range []string{"/switch", "/agents"} {
+		if !strings.Contains(sent[0], want) {
+			t.Errorf("help text %q does not contain %q", sent[0], want)
+		}
+	}
+}
+
+func TestNormalizeBareCommand(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{input: "help", want: "/help"},
+		{input: " HELP ", want: "/help"},
+		{input: "agents", want: "/agents"},
+		{input: "agents list", want: "/agents list"},
+		{input: "please help me", want: ""},
+		{input: "agents now", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := normalizeBareCommand(tt.input); got != tt.want {
+				t.Fatalf("normalizeBareCommand(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandleCommandAgentsListsAllCodexSessions(t *testing.T) {
+	modified := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	agent := &allSessionsCommandAgent{sessions: []AgentSessionInfo{{
+		ID: "session-1234567890", Summary: "fix the build", WorkDir: "/work/sonic", MessageCount: 4, ModifiedAt: modified,
+	}}}
+	p := &stubPlatformEngine{n: "feishu"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangChinese)
+	defer e.cancel()
+
+	if !e.handleCommand(p, &Message{SessionKey: "feishu:chat:user", UserID: "u1", ReplyCtx: "ctx"}, "/agents") {
+		t.Fatal("/agents should be handled as a built-in command")
+	}
+	sent := p.getSent()
+	if len(sent) != 1 {
+		t.Fatalf("sent replies = %d, want 1: %#v", len(sent), sent)
+	}
+	for _, want := range []string{"session-123456", "fix the build", "/work/sonic", "4"} {
+		if !strings.Contains(sent[0], want) {
+			t.Errorf("agents reply %q does not contain %q", sent[0], want)
+		}
+	}
+}
+
+func TestHandleMessageAcceptsBareHelpAndAgents(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		agent   Agent
+		want    string
+	}{
+		{name: "help", content: "help", agent: &stubAgent{}, want: "/agents"},
+		{name: "agents", content: "agents", agent: &allSessionsCommandAgent{sessions: []AgentSessionInfo{{ID: "agent-session"}}}, want: "agent-session"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &stubPlatformEngine{n: "feishu"}
+			e := NewEngine("test", tt.agent, []Platform{p}, "", LangChinese)
+			defer e.cancel()
+			e.handleMessage(p, &Message{Platform: "feishu", SessionKey: "feishu:chat:user", UserID: "u1", Content: tt.content, ReplyCtx: "ctx"})
+			sent := p.getSent()
+			if len(sent) != 1 || !strings.Contains(sent[0], tt.want) {
+				t.Fatalf("bare %s reply = %#v, want one reply containing %q", tt.content, sent, tt.want)
+			}
+		})
+	}
+}
 
 func TestCommandRegistry_AddAndResolve(t *testing.T) {
 	r := NewCommandRegistry()
