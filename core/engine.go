@@ -7872,7 +7872,7 @@ func (e *Engine) listAllAgentSessions(agent Agent) ([]AgentSessionInfo, error) {
 
 func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	if len(args) == 0 {
-		e.reply(p, msg.ReplyCtx, "Usage: /switch <number | id_prefix | name>")
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSwitchUsage))
 		return
 	}
 	query := strings.TrimSpace(strings.Join(args, " "))
@@ -10240,7 +10240,7 @@ func helpCardGroups() []helpCardGroup {
 				{command: "/list", action: "nav:/list"},
 				{command: "/agents", action: "cmd:/agents"},
 				{command: "/current", action: "nav:/current"},
-				{command: "/switch", action: "nav:/list"},
+				{command: "/switch", action: "cmd:/switch"},
 				{command: "/search", action: "cmd:/search"},
 				{command: "/history", action: "nav:/history"},
 				{command: "/delete", action: "cmd:/delete"},

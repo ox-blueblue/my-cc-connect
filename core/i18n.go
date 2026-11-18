@@ -544,6 +544,7 @@ const (
 	MsgDeleteModeDeletingBody   MsgKey = "delete_mode_deleting_body"
 	MsgDeleteModeMissingSession MsgKey = "delete_mode_missing_session"
 
+	MsgSwitchUsage     MsgKey = "switch_usage"
 	MsgSwitchSuccess   MsgKey = "switch_success"
 	MsgSwitchNoMatch   MsgKey = "switch_no_match"
 	MsgSwitchNoSession MsgKey = "switch_no_session"
@@ -3291,6 +3292,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "🗑️ 會話已刪除：%s",
 		LangJapanese:           "🗑️ セッション削除：%s",
 		LangSpanish:            "🗑️ Sesión eliminada: %s",
+	},
+	MsgSwitchUsage: {
+		LangEnglish:            "Enter the target session number and send the full command, e.g. `/switch 2`.",
+		LangChinese:            "请输入目标会话序号，然后发送完整命令，例如 `/switch 2`。",
+		LangTraditionalChinese: "請輸入目標會話序號，然後傳送完整命令，例如 `/switch 2`。",
+		LangJapanese:           "切り替え先のセッション番号を入力し、`/switch 2` のように完全なコマンドを送信してください。",
+		LangSpanish:            "Introduce el número de la sesión de destino y envía el comando completo, por ejemplo `/switch 2`.",
 	},
 	MsgSwitchSuccess: {
 		LangEnglish:            "✅ Switched to: %s (%s, %d msgs)",

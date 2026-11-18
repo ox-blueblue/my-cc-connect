@@ -80,6 +80,35 @@ func TestHelpListsSlashSwitchAndAgentsCommands(t *testing.T) {
 	}
 }
 
+func TestCmdSwitch_NoArgsPromptsForTargetNumber(t *testing.T) {
+	for _, tt := range []struct {
+		lang Language
+		want string
+	}{
+		{LangEnglish, "Enter the target session number"},
+		{LangChinese, "请输入目标会话序号"},
+		{LangTraditionalChinese, "請輸入目標會話序號"},
+		{LangJapanese, "切り替え先のセッション番号を入力"},
+		{LangSpanish, "Introduce el número de la sesión de destino"},
+	} {
+		t.Run(string(tt.lang), func(t *testing.T) {
+			p := &stubPlatformEngine{n: "test"}
+			e := NewEngine("test", &stubAgent{}, []Platform{p}, "", tt.lang)
+			defer e.cancel()
+			e.ReceiveMessage(p, &Message{SessionKey: "test:user", Content: "/switch", ReplyCtx: "ctx"})
+			sent := p.getSent()
+			if len(sent) != 1 {
+				t.Fatalf("switch replies = %d, want 1: %v", len(sent), sent)
+			}
+			for _, want := range []string{tt.want, "/switch 2"} {
+				if !strings.Contains(sent[0], want) {
+					t.Errorf("switch prompt %q does not contain %q", sent[0], want)
+				}
+			}
+		})
+	}
+}
+
 func TestNormalizeBareCommand(t *testing.T) {
 	tests := []struct {
 		input string

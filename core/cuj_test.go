@@ -454,6 +454,58 @@ func (env *cujEnv) activeSession(sessionKey string) *Session {
 // SessionManager. Complements TestSwitchToAgentSession_PreservesHistory.)
 // ===========================================================================
 
+func TestCUJ_B3_HelpSwitchPromptsBeforeSwitching(t *testing.T) {
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	agent := &allSessionsCommandAgent{sessions: []AgentSessionInfo{
+		{ID: "session-one", Summary: "first session"},
+		{ID: "session-two", Summary: "target session"},
+	}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangChinese)
+	defer e.cancel()
+	const key = "test:user"
+	e.sessions.SwitchToAgentSession(key, "session-one", agent.Name(), "first session")
+	send := func(content string) {
+		e.ReceiveMessage(p, &Message{SessionKey: key, Platform: p.Name(), UserID: "user", Content: content, ReplyCtx: "ctx"})
+	}
+
+	// Open help and click its /switch row, using the emitted callback.
+	send("/help")
+	if len(p.repliedCards) != 1 {
+		t.Fatalf("help cards = %d, want 1", len(p.repliedCards))
+	}
+	var action string
+	for _, element := range p.repliedCards[0].Elements {
+		if row, ok := element.(CardListItem); ok && strings.HasPrefix(row.Text, "**/switch**") {
+			action = row.BtnValue
+		}
+	}
+	if !strings.HasPrefix(action, "cmd:") {
+		t.Fatalf("help /switch must dispatch a command to prompt for input, got %q", action)
+	}
+	send(strings.TrimPrefix(action, "cmd:"))
+	sent := p.getSent()
+	if len(sent) != 1 || !strings.Contains(sent[0], "请输入目标会话序号") || !strings.Contains(sent[0], "/switch 2") {
+		t.Fatalf("click should show a target-number prompt and example: %v", sent)
+	}
+
+	// The click alone must leave the original session selected.
+	send("/current")
+	if text := p.repliedCards[len(p.repliedCards)-1].RenderText(); !strings.Contains(text, "session-one") {
+		t.Fatalf("session changed before entering a target: %s", text)
+	}
+
+	// Send the example command, then check the visible selected session.
+	send("/switch 2")
+	sent = p.getSent()
+	if !strings.Contains(sent[len(sent)-1], "已切换到：target session") {
+		t.Fatalf("missing switch confirmation: %v", sent)
+	}
+	send("/current")
+	if text := p.repliedCards[len(p.repliedCards)-1].RenderText(); !strings.Contains(text, "session-two") {
+		t.Fatalf("target session is not selected: %s", text)
+	}
+}
+
 func TestCUJ_B3_SwitchPreservesHistoryEndToEnd(t *testing.T) {
 	env := newCUJEnv(t)
 	key := "test:alice"
